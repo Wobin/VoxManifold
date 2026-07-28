@@ -1,0 +1,4 @@
+*.vortex_backup
+__folder_managed_by_vortex
+.DS_Store
+Thumbs.db
