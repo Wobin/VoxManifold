@@ -9,12 +9,6 @@ party member.
 Vox Manifold performs no gameplay function on its own. It is inert until a consumer mod
 registers.
 
-## Status
-
-Not released. The Immaterium presence surface is undocumented, and permission to use it
-for mod traffic is pending. Do not ship a consumer against this library until that
-permission is granted.
-
 ## Data model
 
 The channel is last-write-wins replicated state, not a message queue:
@@ -293,6 +287,13 @@ additions and reads `c` and `d` on a best-effort basis, so a newer publisher deg
 an older reader rather than failing.
 
 ## Efficiency and limits
+
+Multiplexing keeps the structural footprint constant, not the traffic. Every consumer
+shares one presence key, one hook on the presence map, and one coalesced, rate-limited
+publish cycle, so adding a mod introduces no new key and no extra network write. The
+envelope's size, however, grows with the number of consumers: each adds its own payload
+and a capability-record entry. Total traffic therefore scales with adoption, which is why
+lean payloads matter.
 
 There is no consumer-count limit and no aggregate byte budget. Every registered consumer
 is published.
