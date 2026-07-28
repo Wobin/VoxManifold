@@ -1,12 +1,12 @@
 --[[
     Name: Vox Manifold
     Author: Wobin
-    Date: 2026-07-15
-    Version: 1.0.0
+    Date: 2026-07-29
+    Version: 1.0.1
 --]]
 
 local mod = get_mod("Vox Manifold")
-mod.version = "1.0.0"
+mod.version = "1.0.1"
 
 local KEY = "dtmods"
 local ENVELOPE_VERSION = 1
@@ -51,6 +51,8 @@ local announced_receive = false
 local oversize_reported = {}
 local omit_reported = {}
 
+local EMPTY_ENVELOPE = json.encode({ v = ENVELOPE_VERSION, c = {}, d = {} })
+
 local function debug_on()
     return mod:get("vm_debug") == true
 end
@@ -62,6 +64,9 @@ end
 
 local function encode_now()
     if registry.count() == 0 then
+        if current_envelope and current_envelope ~= EMPTY_ENVELOPE then
+            return EMPTY_ENVELOPE
+        end
         return nil
     end
 
@@ -248,7 +253,7 @@ function api.usage()
 end
 
 mod.update = function(dt)
-    if registry.count() == 0 then
+    if registry.count() == 0 and current_envelope == nil then
         return
     end
 
@@ -261,8 +266,13 @@ mod.update = function(dt)
     current_envelope = encoded
 
     if presence.push() then
-        mod:info(("[Vox Manifold] published envelope: %d mods, %d bytes"):format(
-            registry.count(), #encoded))
+        if registry.count() == 0 then
+            mod:info("[Vox Manifold] retracted: last consumer gone, published empty envelope")
+            current_envelope = nil
+        else
+            mod:info(("[Vox Manifold] published envelope: %d mods, %d bytes"):format(
+                registry.count(), #encoded))
+        end
         dbg("published: %s", encoded)
     end
 end

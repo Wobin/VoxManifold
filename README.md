@@ -117,8 +117,11 @@ interest. Returns a function that removes the callback. Call it in `on_disabled`
 ```lua
 Manifold.unregister(id) -> boolean
 ```
-Remove a consumer. Call this in `on_disabled` and `on_unload`. A registered consumer
-that is not unregistered keeps its capability entry and last payload published.
+Remove a consumer. On the next publish its capability entry and payload are dropped from
+the shared envelope, so peers stop seeing it; when the last consumer unregisters, the
+library publishes an empty envelope to retract and then goes dormant. Call this in
+`on_disabled` and `on_unload`. A registered consumer that is not unregistered keeps its
+capability entry and last payload published.
 
 ### Introspection
 
