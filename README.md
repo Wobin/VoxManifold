@@ -9,6 +9,18 @@ party member.
 Vox Manifold performs no gameplay function on its own. It is inert until a consumer mod
 registers.
 
+## Notice about application
+
+Fatshark have been very [nice](https://discord.com/channels/1048312349867646996/1079236027690012773/1164598923386687509)
+with regards to generally not policing our usage of mods, 
+working on a mutual respect system where we don't rock the boat with specific usage, 
+and they don't have to directly intervene. This is especially relevant to cosmetics in
+the game. Given that a chunk of their revenue is related to cosmetics and the like, they
+would prefer we don't affect it in any way. If they detect any loss in revenue from an 
+increased use in a particular mod, they will start banning users using that mod.
+
+So, *be cool about it*. Don't cross that line
+
 ## Data model
 
 The channel is last-write-wins replicated state, not a message queue:
