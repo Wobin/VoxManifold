@@ -572,5 +572,17 @@ The backend rejected the third one and dropped the presence stream. Under 2.0.0 
 same two consumers occupy 161 and 83 bytes in their own keys, each independently inside
 the limit, and neither can affect the other.
 
-Vox Manifold 2.0.0 reads 1.x peers, so a party member who has not updated stays
-visible. It never publishes the 1.x format, because that is what caused the overflow.
+Vox Manifold 2.0.0 reads 1.x peers, so a party member who has not updated stays visible
+to you. It never publishes the 1.x format, because that is what caused the overflow.
+
+**That compatibility is one-way.** A member still on 1.x reads only the old shared key,
+which 2.0.0 never writes, so you are invisible to them. In a mixed party the two readouts
+disagree: a 2.0.0 member sees everyone, a 1.x member sees only other 1.x members.
+
+Nothing crashes and nothing is corrupted in either direction. A 1.x client reading a
+2.0.0 member simply finds no value and concludes they do not run the consumer, which is
+the same path it takes for anyone who genuinely does not.
+
+The fix is for them to update, which they want regardless: 1.x drops their entire presence
+stream as soon as they run two consumers, and once that happens nobody can read them at
+all, on any version.
