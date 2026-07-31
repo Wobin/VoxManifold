@@ -6,6 +6,7 @@ local tostring = tostring
 
 local ID_PATTERN = "^[a-z0-9_]+%.[a-z0-9_]+$"
 local ID_MIN, ID_MAX = 3, 32
+local VERSION_MAX = 32
 
 return function()
     local entries = {}
@@ -27,10 +28,39 @@ return function()
         return true
     end
 
+    local function validate_version(id, version)
+        if type(version) ~= "string" then
+            return nil, string_format("mod %q version must be a string", tostring(id))
+        end
+        if #version > VERSION_MAX then
+            return nil, string_format(
+                "mod %q version is %d characters; the maximum is %d because it is published on the wire",
+                tostring(id), #version, VERSION_MAX)
+        end
+        return true
+    end
+
+    local function validate_builder(id, builder)
+        if type(builder) ~= "function" then
+            return nil, string_format("mod %q builder must be a function, got %s", tostring(id), type(builder))
+        end
+        return true
+    end
+
     function reg.register(id, mod_name, version, builder)
         local ok, err = validate_id(id)
         if not ok then
             return nil, err
+        end
+
+        local vok, verr = validate_version(id, version)
+        if not vok then
+            return nil, verr
+        end
+
+        local bok, berr = validate_builder(id, builder)
+        if not bok then
+            return nil, berr
         end
 
         local existing = entries[id]

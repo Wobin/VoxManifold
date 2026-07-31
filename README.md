@@ -1,10 +1,9 @@
 # Vox Manifold
 
 A dependency library for Darktide mods. It replicates small per-player state across a
-party by multiplexing each consumer mod's payload into a single Immaterium presence
-key. The transport is Fatshark's backend presence service, so there is no peer-to-peer
-connection, no NAT traversal, and no signalling. Delivery is server-relayed to every
-party member.
+party by giving each consumer mod its own Immaterium presence key. The transport is
+Fatshark's backend presence service, so there is no peer-to-peer connection, no NAT
+traversal, and no signalling. Delivery is server-relayed to every party member.
 
 Vox Manifold performs no gameplay function on its own. It is inert until a consumer mod
 registers.
@@ -76,18 +75,53 @@ Manifold.register(id, owner, builder)
 Register a consumer. `owner` is the consumer's mod object; its `version` field is
 published in the capability record. `builder` is a function returning the payload table
 to publish, or `nil` when there is nothing to publish. The library calls `builder` only
-when it needs a fresh payload. Returns `true`, or `nil, error_string` on a rejected id,
-or a cross-owner id collision. Re-registering the same id from the
-same owner replaces the builder and version, which supports hot reload.
+when it needs a fresh payload.
+
+Returns `true`, or `nil, error_string`. The error is also logged. Always check it:
+
+```lua
+local ok, err = Manifold.register("wobin.havoc", mod, build_payload)
+if not ok then
+    mod:error("could not register with Vox Manifold: " .. tostring(err))
+    return
+end
+```
+
+Rejections, in the order they are checked, so a call with two problems reports the first:
+
+| Error string | Cause and fix |
+| --- | --- |
+| `mod "<id>" owner must be the consumer's mod object (a table), got <type>` | You passed something else as `owner`, commonly `nil` or the builder. The owner's identity is what the id-squatting check compares, so a `nil` owner would let any mod claim any id |
+| `mod id must be a string` | `id` was not a string |
+| `mod id "<id>" must be 3 to 32 characters` | Too short or too long |
+| `mod id "<id>" must be author-scoped as author.name (lowercase [a-z0-9_], one dot)` | Not `author.name` form. Rejects uppercase, hyphens, no dot, and more than one dot |
+| `mod "<id>" version must be a string` | Your mod's `version` field is not a string, for example the number `2.0` |
+| `mod "<id>" version is <n> characters; the maximum is 32 because it is published on the wire` | The version travels inside every value you publish, so an unbounded one could breach the backend's per-value cap on its own |
+| `mod "<id>" builder must be a function, got <type>` | You omitted the builder, or called it instead of passing it. Without this check the mod would be advertised to the whole party while structurally unable to ever publish, silently, for the rest of the session |
+| `mod id "<id>" already claimed by "<other>"; "<yours>" cannot use it` | Another mod registered that id first. Ids are first-come, which is why they are author-scoped. Choose one under your own prefix |
+
+```lua
+Manifold.register("wobin.havoc", nil, build_payload)   -- owner is nil
+Manifold.register("wobin.havoc", build_payload)        -- builder in the owner slot
+Manifold.register("havoc", mod, build_payload)         -- id not author-scoped
+Manifold.register("Wobin.Havoc", mod, build_payload)   -- uppercase
+Manifold.register("wobin.havoc", mod)                  -- builder omitted
+Manifold.register("wobin.havoc", mod, build_payload()) -- builder called, not passed
+
+Manifold.register("wobin.havoc", mod, build_payload)   -- correct
+```
+
+Re-registering the same id from the same owner replaces the builder and version, which
+supports hot reload.
 
 ```lua
 Manifold.mark_dirty(id)
 ```
 Signal that the consumer's state changed. The library re-runs the builder and publishes
 on its own schedule, coalescing and rate-limiting writes. The `id` is validated but not
-scoped: there is one multiplexed envelope, so a publish always carries every consumer.
-Returns `false` if the id is not registered, which surfaces a typo or a call made before
-`register`.
+scoped to just that consumer's key: every registered consumer's key is rebuilt and all
+of them go out together in one merged update. Returns `false` if the id is not
+registered, which surfaces a typo or a call made before `register`.
 
 ```lua
 Manifold.get(member, id) -> table | false | nil
@@ -129,11 +163,32 @@ interest. Returns a function that removes the callback. Call it in `on_disabled`
 ```lua
 Manifold.unregister(id) -> boolean
 ```
-Remove a consumer. On the next publish its capability entry and payload are dropped from
-the shared envelope, so peers stop seeing it; when the last consumer unregisters, the
-library publishes an empty envelope to retract and then goes dormant. Call this in
-`on_disabled` and `on_unload`. A registered consumer that is not unregistered keeps its
-capability entry and last payload published.
+Remove a consumer. The backend merges presence key-values rather than replacing them, so
+simply ceasing to send a consumer's key would leave its last value in place indefinitely.
+To actually clear it, the library overwrites the consumer's own key, `vm_<mod id>`, with
+an explicit empty value on the next publish. That write is what removes it.
+
+That empty value is not sent once and forgotten. It keeps riding along on every presence
+update the game makes until the next publish rebuilds the key map, at which point the key
+is dropped entirely. So the retraction gets many chances to land rather than one.
+
+This matters because a publish reports success when the engine accepted it, not when the
+backend received it. A retraction sent while the presence stream is down would otherwise
+be lost, and the departed consumer would look present to the whole party.
+
+How long the empty value lingers depends on which consumer left:
+
+| Case | Behaviour |
+| --- | --- |
+| Other consumers remain | The empty value rides along until the next publish, then the key vanishes from the map |
+| The last consumer left | There is no next publish, because the library goes quiet with nothing to say. The empty value rides along for the rest of the session |
+
+The second case is the one that needs the guarantee: with nothing left to publish, a lost
+retraction could never be corrected. Carrying the empty value costs a few bytes per retired
+key. It disappears entirely when the game restarts.
+
+Call `unregister` in `on_disabled` and `on_unload`. A registered consumer that is never
+unregistered keeps its capability entry and last payload published.
 
 ### Introspection
 
@@ -149,9 +204,14 @@ The table the consumer's builder currently returns, or `nil`. This runs the buil
 the builder must remain free of side effects.
 
 ```lua
-Manifold.usage() -> { count, bytes }
+Manifold.usage() -> { count, bytes, largest, keys = { [id] = bytes }, limit }
 ```
-Consumer count and the encoded byte length of the last published envelope.
+`count` is the number of registered consumers. `bytes` is the sum of every published
+key's encoded length, informational only. `largest` is the size of the single largest
+published value; compare it against `limit` (250) for real headroom, because the
+backend's cap is per value, not aggregate. `keys[id]` is the size a consumer's value
+would have been, so a shed consumer reports the size that got it shed and can exceed
+`limit`.
 
 ## Example
 
@@ -286,53 +346,231 @@ this will break its own cross-version reads when users run mixed builds.
 
 ## Envelope format
 
-The presence value is a single JSON object:
+Each consumer publishes its own presence key, `vm_<mod id>`, with the mod id escaped so
+it is a valid key: every `_` becomes `_u` first, then every `.` becomes `__` (order
+matters, or the two escapes collide). `wobin.havoc` becomes `vm_wobin__havoc`;
+`lucleto.overflow_meter` becomes `vm_lucleto__overflow_umeter`.
+
+The value at that key is a single JSON object:
 
 ```json
-{ "v": 1, "c": { "author.name": "version" }, "d": { "author.name": { } } }
+{ "v": 2, "m": "<mod version>", "d": { } }
 ```
 
 - `v` is the envelope version.
-- `c` is the capability record: id to version.
-- `d` holds each consumer's payload, keyed by id.
+- `m` is the consumer's version string, capped at 32 source bytes.
+- `d` holds the consumer's payload. It is omitted entirely when the builder returns
+  nothing, which is how a reader distinguishes "no payload" from "empty payload".
 
-The keys `v`, `c`, and `d` are permanent. A future envelope version may add sibling keys
+The keys `v`, `m`, and `d` are permanent. A future envelope version may add sibling keys
 but must not repurpose these three. A reader ignores an unrecognised envelope version's
-additions and reads `c` and `d` on a best-effort basis, so a newer publisher degrades on
-an older reader rather than failing.
+additions and reads `d` on a best-effort basis, so a newer publisher degrades on an
+older reader rather than failing.
+
+Vox Manifold 1.x published every consumer multiplexed into one shared key, `dtmods`,
+holding `{ "v": 1, "c": { "author.name": "version" }, "d": { "author.name": { } } }`.
+2.0.0 still reads that key, so a party member who has not updated stays visible, but it
+never writes it: writing it would reinstate the per-value overflow that the key-per-
+consumer design exists to fix.
 
 ## Efficiency and limits
 
-Multiplexing keeps the structural footprint constant, not the traffic. Every consumer
-shares one presence key, one hook on the presence map, and one coalesced, rate-limited
-publish cycle, so adding a mod introduces no new key and no extra network write. The
-envelope's size, however, grows with the number of consumers: each adds its own payload
-and a capability-record entry. Total traffic therefore scales with adoption, which is why
-lean payloads matter.
+Every consumer gets its own presence key, `vm_<mod id>`, and its own independent
+256-byte budget that does not shrink as other mods are added. They share one hook on
+the presence map and one coalesced, rate-limited publish cycle, so adding a consumer
+introduces no extra network write: all keys go out in a single merged update.
 
-There is no consumer-count limit and no aggregate byte budget. Every registered consumer
-is published.
+The Darktide backend caps a single presence value at 256 bytes and drops the entire
+presence stream when one exceeds it, which takes party, friends and social down with
+it. Vox Manifold therefore treats 250 bytes as a hard ceiling per consumer. A payload
+that would exceed it is dropped and the offending mod is named in the log; the mod
+stays advertised so peers still see it is running, and no other consumer is affected.
+A warning fires at 200 bytes so you get notice before that happens.
 
-Efficiency is encouraged, not enforced:
+Your usable payload budget is `250 - 19 - #version` bytes: 250 minus 19 bytes of fixed
+envelope framing minus the length of your own version string, because the version rides
+on the wire inside every value. For a typical 5-character version like `2.0.0`, that
+works out to 226 bytes; a longer version string eats directly into your budget (a
+32-character version leaves only 199 bytes). Keep payloads small: publish a reference
+(an id or hash the reader resolves locally) rather than a large blob. The presence value
+is shared party traffic on an undocumented backend surface; a lean payload is a courtesy
+to that surface and to the backend's unknown limit on key count.
 
-- A per-consumer payload above 256 bytes encoded is published anyway, and the author is
-  warned once. Keep payloads small: publish a reference (an id or hash the reader
-  resolves locally) rather than a large blob. The presence value is shared party traffic
-  on an undocumented backend surface; a lean payload is a courtesy to that surface and to
-  the other consumers on the channel.
-- A payload that cannot be encoded at all (a function, a cycle) is omitted from the
-  envelope and logged as an error, so one broken payload cannot suppress the others. The
-  consumer remains advertised in the capability record.
+There is no consumer-count limit, but each registered consumer takes its own key, and
+the backend's limit on the number of key-values a client can publish is unknown. A
+warning fires once past 8 registered consumers so this stays visible rather than
+silent.
 
-The one hard bound is on the read path: an inbound peer envelope larger than 16384 bytes
-is rejected before parsing. This bounds decode cost against a hostile or corrupt peer and
-is unrelated to the efficiency target; a legitimately large envelope well under it still
+A payload that cannot be encoded at all (a function, a cycle) is dropped and logged as
+an error, so one broken payload cannot suppress the others. The consumer remains
+advertised in the capability record.
+
+The one hard bound on the read path: an inbound peer value larger than 16384 bytes is
+rejected before parsing. This bounds decode cost against a hostile or corrupt peer and
+is unrelated to the per-value budget; a legitimately sized value well under it still
 decodes.
 
-## Failure logging
+## Diagnostics and troubleshooting
 
-The library logs each publish and the first decode of a peer envelope, and raises a
-single error if an engine accessor it depends on is absent. This channel fails silently
-at the transport level: if the presence key is rejected server-side, publishing
-continues to no effect and peers appear to not run the consumer, with no transport
-error. The log lines are the means of diagnosing that condition.
+Registration errors are documented with [`register`](#api), because you meet them while
+writing the call. Everything below happens later, asynchronously, so it is logged rather
+than returned. All log lines are prefixed `[Vox Manifold]`.
+
+### Publish-time diagnostics
+
+These are logged, not returned, because they happen during a publish rather than a call
+you made. Each is reported **once** per consumer and clears itself if the condition goes
+away, so a payload that grows past a threshold and later shrinks will warn again if it
+regresses.
+
+**Warning: `<Mod> payload is <n> bytes, past the 200-byte comfort line. The hard limit is 250 bytes, after which the payload is dropped.`**
+
+Advance notice. You are still publishing normally. Trim the payload before it reaches the
+ceiling.
+
+**Error: `<Mod> payload is <n> bytes, over the 250-byte backend limit for a single presence value. The payload was dropped; the mod is still advertised. Publish less state.`**
+
+Your payload was shed. Peers can still see that you run the mod, via `has_mod`, but `get`
+returns `false` for you because there is no data. Nobody else is affected.
+
+Long keys and human-readable display strings are what usually does it. The two payloads
+below carry the same information; the sizes are measured, not estimates.
+
+```lua
+-- 262 bytes, SHED. Only the 19-byte capability record reaches the wire.
+local function build_payload()
+    return {
+        rank = 40, charges_remaining = 3, mission_name = "Chasm Logistratum",
+        circumstances = { "Hunting Grounds", "Snipers Everywhere", "Power Supply Interruption" },
+        player_name = "Wobin", last_updated = 1785000000,
+        difficulty = "Havoc 40", auric = true,
+    }
+end
+
+-- 78 bytes, published. Short keys, backend ids, nothing the reader can derive itself.
+local function build_payload()
+    return { r = 40, c = 3, m = "km_enforcer", f = { "hg", "sn", "psi" } }
+end
+```
+
+The savings come from three habits: single-letter keys, backend ids instead of display
+names, and omitting anything the reading side already knows or can look up. The player's
+name and the timestamp in the first version are both things the reader already has.
+
+**Error: `<Mod> payload is not encodable and was omitted. The mod is still advertised.`**
+
+The builder returned a table that cannot become JSON. Causes: a cycle, a function or
+userdata value, `nan` or `inf`, or a key that is neither a string nor a number.
+
+```lua
+return { unit = my_unit }             -- userdata
+return { on_done = callback }         -- function
+return { ratio = hits / shots }       -- nan when shots is 0
+local t = {}; t.self = t; return t    -- cycle
+```
+
+**Warning: `<n> consumers now hold a presence key each, more than the 13 the game itself publishes. Nothing is known to be wrong: the backend's limit on key count is undocumented and untested past this point. Noted here so it is on record if presence misbehaves.`**
+
+Fires once, past 13 consumers. Nothing is broken and there is nothing to do.
+
+The threshold is 13 because that is the only number with evidence behind it. The engine
+publishes exactly 13 presence keys every session, and Vox Manifold 1.x added a fourteenth
+successfully, so 14 keys is known to work. Beyond that nobody has measured anything: the
+backend's limit on key count, if it has one, is undocumented, and no client-side code
+enforces one. Thirteen consumers is the point where this library is putting more keys on
+your presence entry than the game does, which is the last footprint known to be accepted.
+
+It is a warning rather than a cap deliberately. Enforcement is justified where breach is
+known to be catastrophic, which is true of the per-value size limit and is not known to be
+true of the count; a hard cap on a guess would break working setups to prevent something
+hypothetical. The consumer count also appears in every publish log line, so this exists to
+leave a prominent marker for whoever is diagnosing a broken presence stream later.
+
+**Error: `refused to publish: a presence value exceeded the 250-byte limit after shedding. Nothing was sent.`**
+
+A safety net that should be unreachable, since shedding already guarantees the bound.
+Reported once. If you ever see it, please open an issue: it means a value got past two
+independent size guards.
+
+### Engine-contract errors
+
+Reported **once per session** each. These mean a game patch moved something the library
+depends on. They are not caused by your mod and you cannot fix them from a consumer.
+
+| Message | Effect |
+| --- | --- |
+| `PresenceEntryMyself.create_key_values is missing. The game has changed; no mod state can be published.` | Nothing publishes at all |
+| `Managers.presence._update_my_presence is missing. The game has changed; mod state cannot be published.` | Publishes are not pushed |
+| `presence entry has no _key_value_string. The game has changed; no party member state can be read.` | Peers cannot be read |
+| `presence push failed: <error>` | One push threw |
+| `create_key_values failed upstream: <error>. Publishing mod keys only; engine presence fields are left as they are.` | Another mod's hook on the same engine function threw. Vox Manifold keeps working; the other mod is broken |
+
+### What silence means
+
+The transport fails silently. If the backend rejects a value, publishing continues to no
+effect and peers simply appear not to run your mod, with no transport error anywhere.
+That is why the log lines above exist, and why `usage()` is worth checking when something
+does not appear:
+
+```lua
+local u = Manifold.usage()
+mod:info(("%d consumers, largest value %d of %d bytes"):format(u.count, u.largest, u.limit))
+for id, bytes in pairs(u.keys) do
+    mod:info(("  %s wanted %d bytes"):format(id, bytes))
+end
+```
+
+`largest` against `limit` is your real headroom, because the cap is per value. A figure in
+`keys` that exceeds `limit` is a consumer whose payload was shed.
+
+Enable the `vm_debug` setting for per-publish and per-peer-decode logging.
+
+## Migrating from 1.x
+
+Consumers almost certainly need no code changes. `register`, `unregister`, `mark_dirty`,
+`get`, `has_mod`, `members`, `is_myself` and `on_update` all keep their signatures, and
+`get` keeps its three return states: a table when the peer has data, `false` when they
+run the mod but have nothing to say, and `nil` when they do not run it at all.
+
+"Almost certainly" rather than "certainly", because one contract did narrow. `register`
+gained three rejections, and a call that previously succeeded can now fail:
+
+- **A non-function `builder`.** Calling `Manifold.register(id, mod)` with the builder
+  omitted used to succeed. It then advertised your mod to the entire party while being
+  structurally incapable of ever publishing a payload, and said nothing about it. It now
+  fails loudly at registration instead.
+- **A non-table `owner`.** The owner is what the id-squatting check compares, so passing
+  `nil` made every caller present the same identity and defeated it.
+- **A `version` that is not a string or is longer than 32 characters,** because the
+  version rides on the wire inside every published value and an unbounded one could
+  breach the backend's per-value cap on its own.
+
+If you pass your mod object and a real builder function, which is what the examples above
+do and almost certainly what you already do, none of these will ever fire. They are called
+out here rather than left for you to discover from a `register` that quietly returns nil.
+
+Two other things changed, neither of which requires action:
+
+- `usage()` returns `{ count, bytes, largest, keys = { [id] = bytes }, limit }`. It
+  previously returned `{ count, bytes }` measuring one shared envelope. `largest` is the
+  number that matters: the backend's cap is per value, so `largest` against `limit` is
+  your real headroom. `bytes` is the sum across all keys and is informational only.
+  `keys[id]` is the size a consumer's value WOULD have been, so a shed consumer reports
+  the size that got it shed and can exceed `limit`.
+
+Your payload budget is now 226 bytes and it is yours alone. To see what the old shared
+budget actually cost, here are the measured sizes from the report that prompted this
+release, two consumers under 1.x:
+
+| Contents of the single shared value | Bytes |
+| --- | --- |
+| Capability records only, no payloads | 75 |
+| Plus Havoc Auspex's 137-byte payload | 226 |
+| Plus Overflow Meter's 59-byte payload | 311 |
+
+The backend rejected the third one and dropped the presence stream. Under 2.0.0 those
+same two consumers occupy 161 and 83 bytes in their own keys, each independently inside
+the limit, and neither can affect the other.
+
+Vox Manifold 2.0.0 reads 1.x peers, so a party member who has not updated stays
+visible. It never publishes the 1.x format, because that is what caused the overflow.

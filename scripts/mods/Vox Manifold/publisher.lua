@@ -27,12 +27,13 @@ return function(opts)
             return nil
         end
 
+        dirty = false
+
         local encoded = encode_fn()
         if not encoded then
+            elapsed = 0
             return nil
         end
-
-        dirty = false
 
         if encoded == last_sent then
             return nil

@@ -6,6 +6,6 @@ return {
 		en = "Debug logging",
 	},
 	vm_debug_tooltip = {
-		en = "Log verbose diagnostics to the console: every published envelope, and each peer envelope decoded (member, byte size, and the mod ids it carries). Use when a party member's shared state is not appearing.",
+		en = "Log verbose diagnostics to the console: every publish, and each peer value decoded (member, key, and byte size). Use when a party member's shared state is not appearing.",
 	},
 }

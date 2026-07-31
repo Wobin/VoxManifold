@@ -1,4 +1,5 @@
 local pcall = pcall
+local pairs = pairs
 local type = type
 local tostring = tostring
 
@@ -6,7 +7,6 @@ return function(deps)
     local mod = deps.mod
     local managers = deps.managers
     local class = deps.class
-    local KEY = deps.key
 
     local p = {}
     local reported = {}
@@ -19,7 +19,7 @@ return function(deps)
         mod:error(message)
     end
 
-    function p.install(get_envelope)
+    function p.install(get_keys)
         local myself = class and class.PresenceEntryMyself
 
         if not myself or type(myself.create_key_values) ~= "function" then
@@ -30,18 +30,30 @@ return function(deps)
         end
 
         mod:hook(myself, "create_key_values", function(func, self, white_list)
-            local key_values = func(self, white_list)
-            local envelope = get_envelope()
-            if envelope then
-                key_values[KEY] = envelope
+            local ok, key_values = pcall(func, self, white_list)
+
+            if not ok or type(key_values) ~= "table" then
+                report_once("hook_call",
+                    "[Vox Manifold] create_key_values failed upstream: " .. tostring(key_values) ..
+                    ". Publishing mod keys only; engine presence fields are left as they are.")
+                key_values = {}
             end
+
+            local keys = get_keys()
+
+            if keys then
+                for key, value in pairs(keys) do
+                    key_values[key] = value
+                end
+            end
+
             return key_values
         end)
 
         return true
     end
 
-    function p.push()
+    function p.push(keys)
         local presence = managers and managers.presence
 
         if not presence or type(presence._update_my_presence) ~= "function" then
@@ -51,8 +63,15 @@ return function(deps)
             return false
         end
 
+        local white_list = {}
+        if keys then
+            for key in pairs(keys) do
+                white_list[key] = true
+            end
+        end
+
         local ok, err = pcall(function()
-            presence:_update_my_presence({ [KEY] = true })
+            presence:_update_my_presence(white_list)
         end)
 
         if not ok then
@@ -83,7 +102,7 @@ return function(deps)
         return ok and res == true
     end
 
-    function p.read(member)
+    function p.read(member, key)
         local entry = entry_for(member)
         if not entry then
             return nil
@@ -100,7 +119,7 @@ return function(deps)
             return nil
         end
 
-        local ok, raw = pcall(entry._key_value_string, entry, KEY)
+        local ok, raw = pcall(entry._key_value_string, entry, key)
         if not ok then
             return nil
         end
