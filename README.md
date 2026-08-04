@@ -129,9 +129,20 @@ Manifold.get(member, id) -> table | false | nil
 Read a member's payload for `id`. Returns the payload table, `false` if the member runs
 the mod but has no current payload, or `nil` if the member does not run the mod.
 
-`get` returns `nil` for the local player. A client cannot read back its own published
-key; the engine's own presence entry for the local player exposes no read accessor. Use
-`is_myself` to branch and supply the local player's row from the consumer's own state.
+`get` works for the local player as well as for peers, so a reader can loop over
+`members()` uniformly without special-casing itself.
+
+The local player's value is not read back off the wire. A client cannot read its own
+published key, because the engine's presence entry for the local player exposes no read
+accessor. It is decoded from the bytes the library last published instead, which is the
+same thing every peer sees. Two consequences follow. It lags local state by up to the
+publish interval of two seconds, so it is not a substitute for the consumer's own live
+state. And a payload that was shed for exceeding the byte limit reads back as `false`
+here exactly as it does for a peer, which makes an over-budget payload visible locally
+rather than only in the log.
+
+Between `register` and the first publish there is nothing published yet, so `get` returns
+`false` for the local player during that window.
 
 ```lua
 Manifold.has_mod(member, id) -> version_string | nil
@@ -141,6 +152,10 @@ the capability record, so it is available even when the member has no payload. T
 is `tostring(owner.version)` as the publisher set it; it is opaque. The library does not
 parse or compare it. A consumer that gates on version must define and compare its own
 format, and must not use a string comparison for numeric version ordering.
+
+Like `get`, this answers for the local player too, reporting the version of a consumer
+registered on this client. It answers from the local registry before the first publish,
+so it is truthful immediately after `register` rather than after a two-second delay.
 
 ```lua
 Manifold.members() -> array
@@ -154,11 +169,39 @@ Manifold.is_myself(member) -> boolean
 
 ```lua
 Manifold.on_update(callback) -> unsubscribe
+Manifold.on_update(id, callback) -> unsubscribe
 ```
 Register a callback invoked when any member's replicated state may have changed. The
 callback is not scoped to a single id; treat it as a signal to re-read the members of
 interest. Returns a function that removes the callback. Call it in `on_disabled` or
 `on_unload` to avoid a leaked closure across a hot reload.
+
+The `id` is optional and affects nothing but error reporting. It is not validated against
+the registry, does not scope which changes you are told about, and can be passed before
+`register`.
+
+Listeners run inside a `pcall`, so one consumer's broken callback cannot stop the others
+being notified. That means a callback that throws is skipped rather than propagated, and
+the library has to work out whose it was in order to say anything useful about it. Passing
+your registered id settles that outright.
+
+Without one, the library infers it: it records where the callback was defined and which
+file called `on_update`, then at error time looks for a registered consumer whose mod name
+matches that path. A match names that consumer exactly as an explicit id would, so an
+existing consumer that never passes an id is still reported correctly.
+
+The inference is deliberately conservative and never names a consumer it cannot match. A
+callback built by a shared helper in another mod's folder, or a path matching two
+registered consumers at once, both degrade to naming the file rather than blaming the
+wrong mod.
+
+It resolves at error time rather than at registration, because a listener can outlive its
+registration: a consumer that unregisters in `on_disabled` while keeping its callback is
+unattributable until it registers again.
+
+The case inference cannot reach at all is a **read-only consumer**. A mod that only reads
+other members and publishes nothing has no reason to call `register`, never enters the
+registry, and so can never be matched. Pass the id if you want to be named.
 
 ```lua
 Manifold.unregister(id) -> boolean
@@ -217,8 +260,8 @@ would have been, so a shed consumer reports the size that got it shed and can ex
 
 A complete minimal consumer. The mod shares each player's three curio resistances so the
 party can see coverage gaps. It demonstrates the four patterns that a consumer must get
-right: registration with a versioned payload, marking dirty on change, reading the party
-with the local player special-cased, and teardown.
+right: registration with a versioned payload, marking dirty on change, reading every
+member through one uniform loop, and teardown.
 
 Manifest, `Curio Coverage.mod`:
 
@@ -244,8 +287,8 @@ local mod = get_mod("Curio Coverage")
 local ID = "zoze.curios"
 local PAYLOAD_VERSION = 1
 
--- The consumer's own current state, recomputed locally. This is also what the local
--- player's own row is drawn from, because get() cannot read back the local player.
+-- The consumer's own current state, recomputed locally. This is what the builder
+-- publishes, and it is always fresher than what get() reports for the local player.
 local my_resists = { 0, 0, 0 }
 
 -- Decode a peer payload, tolerating older and newer payload versions.
@@ -274,7 +317,7 @@ mod.on_all_mods_loaded = function()
     end)
 
     -- Re-read and refresh the display whenever any member's state changes.
-    mod.manifold_unsub = Manifold.on_update(function()
+    mod.manifold_unsub = Manifold.on_update(ID, function()
         mod.refresh_display()
     end)
 end
@@ -299,11 +342,19 @@ function mod.build_rows()
     for i = 1, #members do
         local member = members[i]
 
-        if Manifold.is_myself(member) then
-            rows[#rows + 1] = { name = "You", resists = my_resists }
-        elseif Manifold.has_mod(member, ID) then
-            local resists = decode(Manifold.get(member, ID))
-            local name = member.name and member:name() or "?"
+        -- has_mod now answers for the local player too, so one branch covers everyone.
+        if Manifold.has_mod(member, ID) then
+            local name, resists
+
+            if Manifold.is_myself(member) then
+                -- Prefer live local state. get() would work here, but it lags by up
+                -- to the two-second publish interval.
+                name, resists = "You", my_resists
+            else
+                name = member.name and member:name() or "?"
+                resists = decode(Manifold.get(member, ID))
+            end
+
             rows[#rows + 1] = { name = name, resists = resists }
         end
     end
@@ -330,9 +381,12 @@ Points the example illustrates:
 
 - The payload carries its own `pv`, and `decode` reads defensively so a future `pv = 2`
   payload with extra fields still yields a row.
-- The local player is drawn from `my_resists`, not from `get`, because `get` returns
-  `nil` for the local player.
-- `has_mod` gates the read, so a member who does not run Curio Coverage produces no row.
+- `has_mod` gates the read for every member including the local player, so one branch
+  covers the whole party and a member who does not run Curio Coverage produces no row.
+- The local row is still drawn from `my_resists`. `get` would answer, but it reports the
+  last published value, which trails live state by up to the publish interval.
+- `on_update` is passed `ID`, so a fault in the callback is reported against Curio
+  Coverage by name instead of being silently skipped.
 - `on_disabled` and `on_unload` both unregister the consumer and drop the `on_update`
   callback, so a hot reload does not leak a registration or a closure.
 
@@ -369,7 +423,7 @@ older reader rather than failing.
 
 Vox Manifold 1.x published every consumer multiplexed into one shared key, `dtmods`,
 holding `{ "v": 1, "c": { "author.name": "version" }, "d": { "author.name": { } } }`.
-2.0.0 still reads that key, so a party member who has not updated stays visible, but it
+2.x still reads that key, so a party member who has not updated stays visible, but it
 never writes it: writing it would reinstate the per-value overflow that the key-per-
 consumer design exists to fix.
 
@@ -389,7 +443,7 @@ A warning fires at 200 bytes so you get notice before that happens.
 
 Your usable payload budget is `250 - 19 - #version` bytes: 250 minus 19 bytes of fixed
 envelope framing minus the length of your own version string, because the version rides
-on the wire inside every value. For a typical 5-character version like `2.0.0`, that
+on the wire inside every value. For a typical 5-character version like `2.1.0`, that
 works out to 226 bytes; a longer version string eats directly into your budget (a
 32-character version leaves only 199 bytes). Keep payloads small: publish a reference
 (an id or hash the reader resolves locally) rather than a large blob. The presence value
@@ -492,6 +546,24 @@ A safety net that should be unreachable, since shedding already guarantees the b
 Reported once. If you ever see it, please open an issue: it means a value got past two
 independent size guards.
 
+### Consumer-callback diagnostics
+
+**Warning: `on_update listener from <who> errored and was skipped: <error>. This is a fault in that consumer, not in Vox Manifold. Further errors from this listener are suppressed until it succeeds again.`**
+
+Your `on_update` callback threw. Listeners run inside a `pcall` so that one broken
+consumer cannot stop the others being notified, which means the error would otherwise
+vanish with no trace: the symptom is a mod that quietly stops updating forever.
+
+Reported once per listener per failure episode, not once per event, because listeners
+fire on every party change. A listener that recovers and later fails again reports again.
+
+`<who>` is your mod name and id when you passed one to `on_update`, or when the library
+matched the callback's file to a registered consumer. When it could not match, it names
+the file and says so, rather than blaming a consumer it is not sure about.
+
+Note this is logged under Vox Manifold's prefix but is not a fault in the library. The
+error text carries the file and line inside your callback where the throw happened.
+
 ### Engine-contract errors
 
 Reported **once per session** each. These mean a game patch moved something the library
@@ -524,6 +596,27 @@ end
 `keys` that exceeds `limit` is a consumer whose payload was shed.
 
 Enable the `vm_debug` setting for per-publish and per-peer-decode logging.
+
+## Changes in 2.1
+
+No consumer needs a code change. Both changes are additive, and the second only makes an
+existing call report better.
+
+**`get` and `has_mod` now answer for the local player.** They previously returned `nil`
+for yourself, so a reader had to special-case `is_myself` before every read. They now
+report what you last published, decoded from the same bytes your peers receive, and
+`has_mod` falls back to the local registry before the first publish. A reader that already
+special-cases the local player keeps working unchanged, and is still the better choice
+when it needs live state rather than published state.
+
+**`on_update` takes an optional id**, used only to attribute an error in your callback.
+Existing one-argument calls are unaffected: the library matches the callback's file against
+registered consumers and usually names you correctly anyway. Pass the id if you are a
+read-only consumer, since one that never calls `register` cannot be matched.
+
+Errors thrown inside an `on_update` callback were previously discarded in silence. They are
+now logged once per failure, which may surface a pre-existing fault in a consumer that
+looked like it had simply stopped updating.
 
 ## Migrating from 1.x
 
@@ -568,19 +661,19 @@ release, two consumers under 1.x:
 | Plus Havoc Auspex's 137-byte payload | 226 |
 | Plus Overflow Meter's 59-byte payload | 311 |
 
-The backend rejected the third one and dropped the presence stream. Under 2.0.0 those
+The backend rejected the third one and dropped the presence stream. Under 2.x those
 same two consumers occupy 161 and 83 bytes in their own keys, each independently inside
 the limit, and neither can affect the other.
 
-Vox Manifold 2.0.0 reads 1.x peers, so a party member who has not updated stays visible
+Vox Manifold 2.x reads 1.x peers, so a party member who has not updated stays visible
 to you. It never publishes the 1.x format, because that is what caused the overflow.
 
 **That compatibility is one-way.** A member still on 1.x reads only the old shared key,
-which 2.0.0 never writes, so you are invisible to them. In a mixed party the two readouts
-disagree: a 2.0.0 member sees everyone, a 1.x member sees only other 1.x members.
+which 2.x never writes, so you are invisible to them. In a mixed party the two readouts
+disagree: a 2.x member sees everyone, a 1.x member sees only other 1.x members.
 
 Nothing crashes and nothing is corrupted in either direction. A 1.x client reading a
-2.0.0 member simply finds no value and concludes they do not run the consumer, which is
+2.x member simply finds no value and concludes they do not run the consumer, which is
 the same path it takes for anyone who genuinely does not.
 
 The fix is for them to update, which they want regardless: 1.x drops their entire presence

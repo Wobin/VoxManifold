@@ -6,9 +6,10 @@ local tostring = tostring
 
 local ID_PATTERN = "^[a-z0-9_]+%.[a-z0-9_]+$"
 local ID_MIN, ID_MAX = 3, 32
-local VERSION_MAX = 32
 
-return function()
+return function(opts)
+    local VERSION_MAX = opts.max_version_bytes
+
     local entries = {}
     local count = 0
 

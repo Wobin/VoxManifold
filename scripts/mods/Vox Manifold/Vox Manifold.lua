@@ -1,16 +1,17 @@
 --[[
     Name: Vox Manifold
     Author: Wobin
-    Date: 2026-07-31
-    Version: 2.0.0
+    Date: 2026-08-04
+    Version: 2.1.0
 --]]
 
 local mod = get_mod("Vox Manifold")
-mod.version = "2.0.0"
+mod.version = "2.1.0"
 
 local pairs = pairs
 local type = type
 local tostring = tostring
+local debug_getinfo = debug and debug.getinfo
 
 local ENVELOPE_VERSION = 2
 local MIN_INTERVAL = 2.0
@@ -35,7 +36,7 @@ local new_keyset    = mod:io_dofile(BASE .. "keyset")
 local new_publisher = mod:io_dofile(BASE .. "publisher")
 local new_presence  = mod:io_dofile(BASE .. "presence")
 
-local registry = new_registry()
+local registry = new_registry({ max_version_bytes = MAX_VERSION_BYTES })
 
 local publisher = new_publisher({ min_interval = MIN_INTERVAL })
 
@@ -71,6 +72,7 @@ local listeners = {}
 local announced_receive = false
 local shed_reported = {}
 local soft_reported = {}
+local listener_reported = {}
 local count_warned = false
 local refused_reported = false
 
@@ -158,16 +160,84 @@ local function encode_now()
     return json.encode(map)
 end
 
+local function match_registered(source)
+    if type(source) ~= "string" then
+        return nil
+    end
+
+    local ids = registry.ids()
+    local found = nil
+
+    for i = 1, #ids do
+        local entry = registry.get(ids[i])
+        local name = entry and entry.mod_name
+
+        if type(name) == "string" and name ~= "" then
+            local hit = source:find("/mods/" .. name .. "/", 1, true)
+                     or source:find("\\mods\\" .. name .. "\\", 1, true)
+
+            if hit then
+                if found then
+                    return nil
+                end
+                found = ids[i]
+            end
+        end
+    end
+
+    return found
+end
+
+local function listener_label(meta)
+    local id = meta and meta.id
+
+    if not id and meta then
+        id = match_registered(meta.cb_source) or match_registered(meta.caller_source)
+    end
+
+    if id then
+        local entry = registry.get(id)
+        if entry then
+            return ("%s (%s)"):format(tostring(entry.mod_name), id)
+        end
+        return id
+    end
+
+    local source = meta and (meta.cb_source or meta.caller_source)
+    if source then
+        return ("an unmatched consumer at %s:%s"):format(
+            tostring(source), tostring(meta.cb_line or "?"))
+    end
+
+    return "an unidentified consumer"
+end
+
+local function report_listener_error(cb, meta, err)
+    if listener_reported[cb] then
+        return
+    end
+    listener_reported[cb] = true
+
+    mod:warning(("[Vox Manifold] on_update listener from %s errored and was skipped: %s. This is a fault in that consumer, not in Vox Manifold. Further errors from this listener are suppressed until it succeeds again."):format(
+        listener_label(meta), tostring(err)))
+end
+
 local function bump()
     read_cache = {}
 
-    local snapshot = {}
-    for cb in pairs(listeners) do
-        snapshot[#snapshot + 1] = cb
+    local cbs, metas = {}, {}
+    for cb, meta in pairs(listeners) do
+        cbs[#cbs + 1] = cb
+        metas[#metas + 1] = meta
     end
 
-    for i = 1, #snapshot do
-        pcall(snapshot[i])
+    for i = 1, #cbs do
+        local ok, err = pcall(cbs[i])
+        if ok then
+            listener_reported[cbs[i]] = nil
+        else
+            report_listener_error(cbs[i], metas[i], err)
+        end
     end
 end
 
@@ -214,11 +284,44 @@ local function read_key(member, key, decode)
     return decoded
 end
 
+local function decode_self(id, key)
+    local raw = current_keys and current_keys[key]
+
+    if raw and raw ~= "" then
+        local decoded = envelope.decode(raw)
+        if decoded then
+            return decoded
+        end
+    end
+
+    local entry = registry.get(id)
+    if entry then
+        return envelope.advertised(entry.version)
+    end
+
+    return nil
+end
+
 local function read_consumer(member, id)
     local key = keys.key_for(id)
     if not key then
         return nil
     end
+
+    if presence.is_myself(member) then
+        local cache = member_cache(member)
+        local cached = cache[key]
+        if cached ~= nil then
+            if cached == false then return nil end
+            return cached
+        end
+
+        local decoded = decode_self(id, key)
+        cache[key] = decoded or false
+
+        return decoded
+    end
+
     return read_key(member, key, envelope.decode)
 end
 
@@ -310,13 +413,35 @@ function api.is_myself(member)
     return presence.is_myself(member)
 end
 
-function api.on_update(cb)
+function api.on_update(id, cb)
+    if type(id) == "function" and cb == nil then
+        cb, id = id, nil
+    end
+
     if type(cb) ~= "function" then
         return function() end
     end
-    listeners[cb] = true
+
+    local meta = { id = type(id) == "string" and id or nil }
+
+    if not meta.id and debug_getinfo then
+        local ok, info = pcall(debug_getinfo, cb, "S")
+        if ok and type(info) == "table" and info.what ~= "C" then
+            meta.cb_source = info.source
+            meta.cb_line = info.linedefined
+        end
+
+        local okc, caller = pcall(debug_getinfo, 2, "S")
+        if okc and type(caller) == "table" and caller.what ~= "C" then
+            meta.caller_source = caller.source
+        end
+    end
+
+    listeners[cb] = meta
+
     return function()
         listeners[cb] = nil
+        listener_reported[cb] = nil
     end
 end
 
@@ -381,6 +506,8 @@ mod.update = function(dt)
 
     current_keys = pending_keys
     keyset.commit(current_keys)
+
+    read_cache = {}
 
     if presence.push(current_keys) then
         if registry.count() == 0 then

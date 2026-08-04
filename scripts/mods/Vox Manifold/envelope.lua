@@ -101,6 +101,10 @@ return function(deps, opts)
         return { version = version, mod_version = parsed.m, data = data }
     end
 
+    function env.advertised(mod_version)
+        return { version = VERSION, mod_version = clamp_version(mod_version), data = nil }
+    end
+
     function env.get(decoded)
         if not decoded then
             return nil
